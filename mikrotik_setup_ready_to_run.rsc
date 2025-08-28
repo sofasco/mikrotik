@@ -1,9 +1,5 @@
-# Mikrotik Ready-to-Run Setup Script (RouterOS)
-# Usage:
-# 1) Edit variables in the "CONFIGURATION" section below to match your environment.
-# 2) Paste the whole file into Winbox > New Terminal or use /import if uploaded to Files.
-# 3) This script defaults to WAN via DHCP on interface ether1. Uncomment PPPoE/Static blocks if needed.
-# 4) After applying, run the verification commands at the end.
+# Mikrotik Ready-to-Run Setup Script (idempotent + backup)
+# Usage: edit CONFIGURATION below then paste entire file into Winbox > New Terminal or upload to Files and run /import.
 
 # --------------------------
 # CONFIGURATION - EDIT ME
@@ -26,12 +22,13 @@
 
 # Wireless config
 :local WIFI_IF "wlan1"            # wireless interface name (change if different)
-:local WIFI_SSID "MikroTik-WiFi"
-:local WIFI_PSK  "StrongPassword123"  # change to a strong password
+:local WIFI_SSID "Ferdinand"      # default SSID (updated to Ferdinand)
+:local WIFI_PSK  "12345678"       # default PSK (updated to 12345678)
 :local WIFI_COUNTRY "ID"          # country code (ID for Indonesia)
+:local WIFI_SEC_PROFILE "sec-ferdinand"
 
-# Admin account
-:local NEW_ADMIN_PASS "VeryStrongAdminPassword"
+# Admin account (only change if you want to update admin password)
+:local NEW_ADMIN_PASS ""
 
 # --------------------------
 # SAFETY - preview interfaces
@@ -43,15 +40,13 @@
 # Pause for 5 seconds to let user abort if wrong
 :delay 5s
 
-# --------------------------
-# 1) Rename physical interfaces (optional)
-# --------------------------
-:put "Renaming interfaces (if default names match)..."
-:if ([/interface ethernet find name=$WAN_IF] != "") do={:put ("WAN interface exists: "$WAN_IF)}
-# Note: We don't forcibly rename here to avoid breaking custom setups.
+# Create backup/export before changes
+:local fname ("backup-before-setup-" . [/system identity get name] . "-" . [:tonum [/system resource get uptime]] . ".rsc")
+/export file=$fname
+:put ("Exported current config to file: "$fname)
 
 # --------------------------
-# 2) Create bridge for LAN and add ports
+# 1) Create bridge for LAN and add ports (idempotent)
 # --------------------------
 :if ([:len [/interface bridge find name=$BRIDGE_NAME]] = 0) do={
     /interface bridge add name=$BRIDGE_NAME
@@ -71,9 +66,8 @@
 }
 
 # --------------------------
-# 3) Configure LAN IP and DHCP server
+# 2) Configure LAN IP and DHCP server
 # --------------------------
-/ip address
 :if ([:len [/ip address find interface=$BRIDGE_NAME]] = 0) do={
     /ip address add address=$LAN_GW/24 interface=$BRIDGE_NAME comment="LAN Gateway"
     :put ("Assigned LAN gateway: "$LAN_GW)
@@ -81,14 +75,12 @@
     :put "LAN address already exists on bridge"
 }
 
-# DHCP pool & server
-/ip pool
+# DHCP pool & server (idempotent)
 :if ([:len [/ip pool find name=dhcp_pool1]] = 0) do={
     /ip pool add name=dhcp_pool1 ranges=($DHCP_RANGE_START..$DHCP_RANGE_END)
     :put "Created DHCP pool: dhcp_pool1"
 }
 
-/ip dhcp-server
 :if ([:len [/ip dhcp-server find name=dhcp1]] = 0) do={
     /ip dhcp-server add name=dhcp1 interface=$BRIDGE_NAME address-pool=dhcp_pool1 lease-time=1d disabled=no
     /ip dhcp-server network add address=$LAN_SUBNET gateway=$LAN_GW dns-server=$DNS_SERVERS
@@ -98,7 +90,7 @@
 }
 
 # --------------------------
-# 4) Configure WAN (default: DHCP)
+# 3) Configure WAN (default: DHCP)
 # --------------------------
 :put ("Configuring WAN mode: "$WAN_MODE)
 
@@ -111,7 +103,7 @@
     }
 }
 
-# PPPoE example (uncomment in CONFIGURATION to use pppoe)
+# PPPoE
 :if ($WAN_MODE = "pppoe") do={
     :if ([:len [/interface pppoe-client find name=pppoe-out1]] = 0) do={
         /interface pppoe-client add name=pppoe-out1 interface=$WAN_IF user=$PPP_USER password=$PPP_PASS use-peer-dns=yes add-default-route=yes disabled=no
@@ -121,7 +113,7 @@
     }
 }
 
-# Static IP example
+# Static
 :if ($WAN_MODE = "static") do={
     :if ([:len [/ip address find interface=$WAN_IF]] = 0) do={
         /ip address add address=$STATIC_IP interface=$WAN_IF
@@ -133,7 +125,7 @@
 }
 
 # --------------------------
-# 5) NAT (Masquerade) on outbound
+# 4) NAT (Masquerade) on outbound
 # --------------------------
 :local natExists [/ip firewall nat find chain=srcnat out-interface=$WAN_IF action=masquerade]
 :if ($natExists = "") do={
@@ -143,75 +135,45 @@
     :put "Masquerade already exists for $WAN_IF"
 }
 
-# If using PPPoE, also ensure NAT for pppoe-out1
-:if ($WAN_MODE = "pppoe") do={
-    :local natPppExists [/ip firewall nat find chain=srcnat out-interface=pppoe-out1 action=masquerade]
-    :if ($natPppExists = "") do={
-        /ip firewall nat add chain=srcnat out-interface=pppoe-out1 action=masquerade comment="NAT PPPoE"
-        :put "Added masquerade NAT for pppoe-out1"
-    }
-}
-
 # --------------------------
-# 6) Basic Firewall rules
+# 5) Basic Firewall rules (idempotent)
 # --------------------------
 :put "Configuring basic firewall rules"
 
-# accept established & related
-:local eR [/ip firewall filter find chain=input connection-state=established,related action=accept]
-:if ($eR = "") do={/ip firewall filter add chain=input connection-state=established,related action=accept comment="accept established"}
-
-# drop invalid
-:local inv [/ip firewall filter find chain=input connection-state=invalid action=drop]
-:if ($inv = "") do={/ip firewall filter add chain=input connection-state=invalid action=drop comment="drop invalid"}
-
-# allow LAN to router (management from LAN)
-:local lanInput [/ip firewall filter find chain=input in-interface=$BRIDGE_NAME action=accept]
-:if ($lanInput = "") do={/ip firewall filter add chain=input in-interface=$BRIDGE_NAME action=accept comment="allow LAN to router"}
-
-# drop input from WAN
-:local dropWan [/ip firewall filter find chain=input in-interface=$WAN_IF action=drop]
-:if ($dropWan = "") do={/ip firewall filter add chain=input in-interface=$WAN_IF action=drop comment="drop input from WAN"}
-
-# FORWARD rules
-:local forwardER [/ip firewall filter find chain=forward connection-state=established,related action=accept]
-:if ($forwardER = "") do={/ip firewall filter add chain=forward connection-state=established,related action=accept comment="forward established"}
-
-:local forwardInvalid [/ip firewall filter find chain=forward connection-state=invalid action=drop]
-:if ($forwardInvalid = "") do={/ip firewall filter add chain=forward connection-state=invalid action=drop comment="forward drop invalid"}
-
-:local lanToWan [/ip firewall filter find chain=forward in-interface=$BRIDGE_NAME out-interface=$WAN_IF action=accept]
-:if ($lanToWan = "") do={/ip firewall filter add chain=forward in-interface=$BRIDGE_NAME out-interface=$WAN_IF action=accept comment="LAN to WAN"}
-
-:local dropOther [/ip firewall filter find chain=forward action=drop]
-:if ($dropOther = "") do={/ip firewall filter add chain=forward action=drop comment="drop other forward"}
+:if ([:len [/ip firewall filter find chain=input connection-state=established,related]] = 0) do={/ip firewall filter add chain=input connection-state=established,related action=accept comment="accept established"}
+:if ([:len [/ip firewall filter find chain=input connection-state=invalid]] = 0) do={/ip firewall filter add chain=input connection-state=invalid action=drop comment="drop invalid"}
+:if ([:len [/ip firewall filter find chain=input in-interface=$BRIDGE_NAME]] = 0) do={/ip firewall filter add chain=input in-interface=$BRIDGE_NAME action=accept comment="allow LAN to router"}
+:if ([:len [/ip firewall filter find chain=input in-interface=$WAN_IF]] = 0) do={/ip firewall filter add chain=input in-interface=$WAN_IF action=drop comment="drop input from WAN"}
+:if ([:len [/ip firewall filter find chain=forward connection-state=established,related]] = 0) do={/ip firewall filter add chain=forward connection-state=established,related action=accept comment="forward established"}
+:if ([:len [/ip firewall filter find chain=forward connection-state=invalid]] = 0) do={/ip firewall filter add chain=forward connection-state=invalid action=drop comment="forward drop invalid"}
+:if ([:len [/ip firewall filter find chain=forward in-interface=$BRIDGE_NAME out-interface=$WAN_IF]] = 0) do={/ip firewall filter add chain=forward in-interface=$BRIDGE_NAME out-interface=$WAN_IF action=accept comment="LAN to WAN"}
+:if ([:len [/ip firewall filter find chain=forward action=drop]] = 0) do={/ip firewall filter add chain=forward action=drop comment="drop other forward"}
 
 # --------------------------
-# 7) Wireless secure setup (if wlan exists)
+# 6) Wireless secure setup (if wlan exists)
 # --------------------------
 :if ([:len [/interface wireless find name=$WIFI_IF]] > 0) do={
     /interface wireless set $WIFI_IF country=$WIFI_COUNTRY
-    :local spIndex [/interface wireless security-profiles find name=sec-wpa2]
+    :local spIndex [/interface wireless security-profiles find name=$WIFI_SEC_PROFILE]
     :if ($spIndex = "") do={
-        /interface wireless security-profiles add name=sec-wpa2 authentication-types=wpa2-psk mode=dynamic-keys wpa2-pre-shared-key=$WIFI_PSK
-        :put "Created security-profile sec-wpa2"
+        /interface wireless security-profiles add name=$WIFI_SEC_PROFILE authentication-types=wpa2-psk mode=dynamic-keys wpa2-pre-shared-key=$WIFI_PSK
+        :put "Created security-profile $WIFI_SEC_PROFILE"
     } else={
-        :put "security-profile sec-wpa2 already exists"
+        :put "security-profile $WIFI_SEC_PROFILE already exists"
     }
-    /interface wireless set $WIFI_IF mode=ap-bridge ssid=$WIFI_SSID frequency=auto disabled=no security-profile=sec-wpa2
+    /interface wireless set $WIFI_IF mode=ap-bridge ssid=$WIFI_SSID frequency=auto disabled=no security-profile=$WIFI_SEC_PROFILE
     # Add wlan to bridge
     :local wlanBridge [/interface bridge port find interface=$WIFI_IF and bridge=$BRIDGE_NAME]
-    :if ($wlanBridge = "") do={/interface bridge port add bridge=$BRIDGE_NAME interface=$WIFI_IF; :put "Added $WIFI_IF to $BRIDGE_NAME"} else={:put "$WIFI_IF already in bridge"}
+    :if ($wlanBridge = "") do={/interface bridge port add bridge=$BRIDGE_NAME interface=$WIFI_IF; :put ("Added "$WIFI_IF" to "$BRIDGE_NAME)} else={:put ($WIFI_IF" already in bridge")}
 } else={
     :put "Wireless interface $WIFI_IF not found; skipping wireless setup"
 }
 
 # --------------------------
-# 8) Admin password & services
+# 7) Admin password & services (optional)
 # --------------------------
-:if ([:len [/user find name=admin]] > 0) do={
-    /user set admin password=$NEW_ADMIN_PASS
-    :put "Admin password updated"
+:if ($NEW_ADMIN_PASS != "") do={
+    :if ([:len [/user find name=admin]] > 0) do={/user set admin password=$NEW_ADMIN_PASS; :put "Admin password updated"}
 }
 
 # Restrict Winbox/SSH to LAN only (recommended)
@@ -221,7 +183,7 @@
 :if ($srvSSH != "") do={/ip service set ssh address=($LAN_SUBNET)}
 
 # --------------------------
-# 9) Final verification commands to run manually (or see below)
+# 8) Final verification commands to run manually (or see below)
 # --------------------------
 :put "Setup finished. Run verification commands below to confirm connectivity."
 
